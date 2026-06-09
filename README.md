@@ -16,9 +16,10 @@ The processing chain is:
 2. create the required mask, tile extent, and parameter files
 3. run a UDF or standard TSA workflow in FORCE
 4. collect the raw FORCE output tiles
-5. apply a shared radiometric stretch across all tiles
-6. export WMS-ready products such as RGB or CIR
-7. optionally mosaic the outputs into a larger basemap product
+5. clip each intersecting FORCE tile to the AOI and write compressed raw tile outputs
+6. apply a shared radiometric stretch across the clipped tiles
+7. export WMS-ready products such as RGB or CIR
+8. build a GDAL VRT mosaic and optionally a final GeoTIFF mosaic
 
 For the default UDF workflow, the repository uses `utils/skel/udf_rgb_p25_least_cloudy_block.py`. That UDF keeps the least cloudy observations and writes percentile-based RED, GREEN, BLUE, NIR, and valid-scene outputs that are later converted to display-ready imagery.
 
@@ -37,6 +38,7 @@ The code is designed for Ubuntu-style environments and expects:
 - Python 3.9
 - FORCE 3.9.02-dev or a compatible Docker image
 - Docker access for running FORCE commands
+- `gdal-bin` for clipping, VRT build, and final GeoTIFF export
 - `xterm` for the current execution flow
 
 Setup example:
@@ -46,7 +48,7 @@ conda create --name sits_basemap python==3.9
 conda activate sits_basemap
 cd /path/to/SITS_basemap_wms
 pip install -r requirements.txt
-sudo apt-get install xterm
+sudo apt-get install xterm gdal-bin
 ```
 
 If FORCE is not installed locally, use the official Docker workflow:
@@ -86,27 +88,37 @@ This command:
 - prepares FORCE parameter files
 - runs FORCE for each AOI
 - finds all raw output tiles in `tiles_tss`
-- exports WMS-ready `rgb` and `cir` products
-- writes mosaics unless mosaic creation is disabled
+- clips intersecting raw tiles to the AOI
+- exports WMS-ready `rgb` and `cir` tile products
+- writes VRT mosaics and can optionally materialize final GeoTIFF mosaics
 
 ## Useful Options
 
 - `--skip-prepare`: reuse existing FORCE parameter files
 - `--skip-force`: skip FORCE execution and only render from existing raw tiles
 - `--skip-render`: stop after FORCE preparation and execution
-- `--no-mosaic`: export per-tile products without building a mosaic
+- `--skip-clip`: reuse already clipped raw FORCE tiles from a previous run
+- `--skip-vrt`: export tile products without building the VRT mosaic
+- `--skip-final-raster`: keep the VRT and tile products but do not materialize the final GeoTIFF mosaic
+- `--overwrite-tiles`: rebuild clipped and rendered tile outputs
+- `--no-overviews`: disable overview creation on rendered outputs
 - `--workflow tsa`: use the standard TSA parameter generation instead of the UDF workflow
 - `--min-valid-scenes`: require a minimum number of valid scenes per pixel
 - `--low-pct` and `--high-pct`: control the global stretch used for WMS export
 - `--product rgb` or `--product cir`: choose the rendered display products
+- `--compression-method`, `--bigtiff`, `--zlevel`, `--blocksize`: control GeoTIFF storage for large runs
+- `--num-threads` and `--cachemax-mb`: tune GDAL clipping performance
 
 ## Outputs
 
-The rendered products are written next to the FORCE raw tiles and can include:
+The rendered products are written under `process/results/<project_name>/` and can include:
 
-- WMS-ready RGB GeoTIFFs
-- WMS-ready CIR GeoTIFFs
-- optional project-wide mosaics
+- clipped raw FORCE tiles for resumable postprocessing
+- WMS-ready RGB GeoTIFF tiles
+- WMS-ready CIR GeoTIFF tiles
+- project-wide VRT mosaics
+- optional project-wide GeoTIFF mosaics
+- JSON reports for clipping and rendering stages
 
 The rendering step preserves an alpha band and valid-scene information so the outputs are easier to use in map services and downstream quality control.
 
@@ -114,6 +126,7 @@ The rendering step preserves an alpha band and valid-scene information so the ou
 
 - AOI shapefiles are reprojected to EPSG:3035 when needed.
 - FORCE paths and mount points are currently configured through CLI arguments such as `--base-path`, `--local-dir`, and `--force-dir`.
+- For Germany-scale production, the workflow writes both the VRT and the final GeoTIFF mosaic by default. Use `--skip-final-raster` only when you explicitly want VRT-only delivery.
 - Always inspect generated `.prm` files before launching large production runs.
 
 ## Versioning

@@ -1,10 +1,10 @@
-'''python force_wms.py \
+"""python /rvt_mount/SITS_basemap_wms/force_wms.py \
   --project-name zGermany_full_tiles \
-  --aoi "/rvt_mount/3DTests/data/harm_data/shp_germany_border.shp" \
+  --aoi "/path/to/germany.shp" \
   --workflow udf \
   --udf-source utils/skel/udf_rgb_p25_least_cloudy_block.py \
   --product rgb \
-  --product cir'''
+  --product cir"""
 
 
 import argparse
@@ -14,7 +14,17 @@ from pathlib import Path
 
 from utils.force_class_utils import force_class, force_class_udf
 from utils.utils import create_folder_structure, execute_cmd
-from utils.wms_rgb import PRODUCTS, batch_export_product, collect_raw_tifs, mosaic_wms_rgb
+from utils.wms_rgb import (
+    DEFAULT_BIGTIFF,
+    DEFAULT_BLOCKSIZE,
+    DEFAULT_COMPRESSION,
+    DEFAULT_OVERVIEW_RESAMPLING,
+    DEFAULT_ZLEVEL,
+    PRODUCTS,
+    clip_force_raw_tiles,
+    collect_raw_tifs,
+    render_product_tiles,
+)
 
 
 def parse_args():
@@ -49,13 +59,32 @@ def parse_args():
     parser.add_argument("--skip-prepare", action="store_true")
     parser.add_argument("--skip-force", action="store_true")
     parser.add_argument("--skip-render", action="store_true")
-    parser.add_argument("--no-mosaic", action="store_true")
+    parser.add_argument("--skip-clip", action="store_true", help="Reuse already clipped raw tiles.")
+    parser.add_argument("--skip-vrt", action="store_true", help="Skip VRT creation for rendered outputs.")
+    parser.add_argument(
+        "--skip-final-raster",
+        action="store_true",
+        help="Do not materialize the final GeoTIFF mosaic. By default the workflow writes both VRT and final mosaic.",
+    )
+    parser.add_argument("--overwrite-tiles", action="store_true", help="Rebuild clipped and rendered tile outputs.")
+    parser.add_argument(
+        "--no-overviews",
+        action="store_true",
+        help="Disable overview creation on rendered tiles and final GeoTIFF outputs.",
+    )
     parser.add_argument("--min-valid-scenes", type=int, default=3)
     parser.add_argument("--low-pct", type=float, default=5.0)
     parser.add_argument("--high-pct", type=float, default=95.0)
     parser.add_argument("--sample-step", type=int, default=64)
     parser.add_argument("--smooth-size", type=int)
     parser.add_argument("--balance-mode", choices=("mean_std",))
+    parser.add_argument("--num-threads", default="ALL_CPUS")
+    parser.add_argument("--cachemax-mb", type=int, default=512)
+    parser.add_argument("--compression-method", default=DEFAULT_COMPRESSION)
+    parser.add_argument("--bigtiff", default=DEFAULT_BIGTIFF)
+    parser.add_argument("--zlevel", default=DEFAULT_ZLEVEL)
+    parser.add_argument("--blocksize", type=int, default=DEFAULT_BLOCKSIZE)
+    parser.add_argument("--overview-resampling", default=DEFAULT_OVERVIEW_RESAMPLING)
     parser.add_argument(
         "--raw-suffix",
         default="_HL_UDF_SEN2L_PYP.tif",
@@ -124,43 +153,97 @@ def execute_force_jobs(args, jobs):
         execute_cmd(str(job["params_path"]), args.hold, args.local_dir, args.force_dir)
 
 
+def _collect_clipped_tiles(job, clipped_root_dir: Path):
+    clipped_job_dir = clipped_root_dir / job["name"]
+    clipped_tifs = collect_raw_tifs(clipped_job_dir, suffix=".tif")
+    if not clipped_tifs:
+        raise FileNotFoundError(
+            f"No clipped raw tiles found for {job['name']} under {clipped_job_dir}. "
+            f"Remove --skip-clip or check the prior clipping run."
+        )
+    return clipped_tifs
+
+
 def render_products(args, jobs, products):
-    raw_tifs = []
+    project_results_dir = Path(args.base_path) / "process" / "results" / args.project_name
+    clipped_root_dir = project_results_dir / "raw_clipped_tiles"
+    clipped_root_dir.mkdir(parents=True, exist_ok=True)
+
+    clipped_raw_tifs = []
     for job in jobs:
         job_raw_tifs = collect_raw_tifs(job["raw_tiles_root"], suffix=args.raw_suffix)
         if not job_raw_tifs:
             print(f"No raw tiles found for {job['name']} under {job['raw_tiles_root']}")
             continue
-        raw_tifs.extend(job_raw_tifs)
 
-    if not raw_tifs:
-        raise FileNotFoundError("No raw FORCE tiles were found for rendering.")
+        if args.skip_clip:
+            job_clipped_tifs = _collect_clipped_tiles(job, clipped_root_dir)
+        else:
+            clipped_output_dir = clipped_root_dir / job["name"]
+            report_path = project_results_dir / f"{job['name']}_raw_clip_report.json"
+            job_clipped_tifs, report = clip_force_raw_tiles(
+                raw_tifs=job_raw_tifs,
+                job_name=job["name"],
+                aoi_path=Path(job["aoi"]),
+                output_dir=clipped_output_dir,
+                num_threads=args.num_threads,
+                cachemax_mb=args.cachemax_mb,
+                overwrite_tiles=args.overwrite_tiles,
+                compression_method=args.compression_method,
+                bigtiff=args.bigtiff,
+                zlevel=args.zlevel,
+                blocksize=args.blocksize,
+                report_path=report_path,
+            )
+            print(
+                f"[clip:{job['name']}] prepared {report['written_or_reused_tiles']} tile(s); "
+                f"reused {report['reused_tiles']}; skipped {report['skipped_tiles']}"
+            )
 
-    mosaic_dir = Path(args.base_path) / "process" / "temp" / args.project_name / "FORCE"
+        clipped_raw_tifs.extend(job_clipped_tifs)
+
+    if not clipped_raw_tifs:
+        raise FileNotFoundError("No clipped FORCE tiles were found for rendering.")
+
     for product_name in products:
-        outputs, stretch = batch_export_product(
-            raw_tifs,
+        product_dir = project_results_dir / f"{product_name}_tiles"
+        vrt_path = None if args.skip_vrt else project_results_dir / f"{args.project_name}_{product_name}_mosaic.vrt"
+        final_raster_path = (
+            None
+            if args.skip_final_raster
+            else project_results_dir / f"{args.project_name}_{product_name}_mosaic.tif"
+        )
+        report_path = project_results_dir / f"{args.project_name}_{product_name}_report.json"
+        result = render_product_tiles(
+            clipped_raw_tifs,
             product_name=product_name,
+            output_dir=product_dir,
+            vrt_output_path=vrt_path,
+            final_output_path=final_raster_path,
+            report_path=report_path,
             low_pct=args.low_pct,
             high_pct=args.high_pct,
             sample_step=args.sample_step,
             min_valid_scenes=args.min_valid_scenes,
             smooth_size=args.smooth_size,
             balance_mode=args.balance_mode,
+            overwrite_tiles=args.overwrite_tiles,
+            build_overviews=not args.no_overviews,
+            overview_resampling=args.overview_resampling,
+            skip_vrt=args.skip_vrt,
+            skip_final_raster=args.skip_final_raster,
+            compression_method=args.compression_method,
+            bigtiff=args.bigtiff,
+            zlevel=args.zlevel,
+            blocksize=args.blocksize,
         )
-        print(f"[{product_name}] Processed {len(outputs)} tiles")
+        stretch = result["stretch"]
+        print(f"[{product_name}] Processed {len(result['tile_outputs'])} tiles")
         print(f"[{product_name}] Global stretch: {stretch[0]:.3f} - {stretch[1]:.3f}")
-
-        if args.no_mosaic:
-            continue
-
-        mosaic_path = mosaic_dir / f"{args.project_name}_{product_name}_mosaic.tif"
-        mosaic_wms_rgb(
-            outputs,
-            mosaic_path,
-            band_descriptions=PRODUCTS[product_name]["descriptions"],
-        )
-        print(f"[{product_name}] Mosaic written to: {mosaic_path}")
+        if result["vrt_output"]:
+            print(f"[{product_name}] VRT written to: {result['vrt_output']}")
+        if result["final_raster_output"]:
+            print(f"[{product_name}] Final raster written to: {result['final_raster_output']}")
 
 
 def main():
