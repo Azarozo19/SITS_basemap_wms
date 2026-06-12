@@ -21,7 +21,7 @@ The processing chain is:
 7. export WMS-ready products such as RGB or CIR
 8. build a GDAL VRT mosaic and optionally a final GeoTIFF mosaic
 
-For the default UDF workflow, the repository uses `utils/skel/udf_rgb_p25_least_cloudy_block.py`. That UDF keeps the least cloudy observations and writes percentile-based RED, GREEN, BLUE, NIR, and valid-scene outputs that are later converted to display-ready imagery.
+For the default UDF workflow, the repository uses `utils/skel/udf_rgb_p25_least_cloudy_block.py`. That UDF keeps the least cloudy observations and writes percentile-based RED, GREEN, BLUE, NIR, and valid-scene outputs that are later converted to display-ready imagery and FORCE 3.9.02.
 
 ## Main Files
 
