@@ -6,5 +6,6 @@ __pycache__/
 .DS_Store
 
 process/
+logs/
 .pytest_cache/
 .mypy_cache/

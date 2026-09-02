@@ -1,5 +1,11 @@
 import os
 import subprocess
+
+
+def _mount_list(mounts):
+    return [mounts] if isinstance(mounts, str) else list(mounts)
+
+
 def create_folder_structure(base_path):
     # Define the folder structure
     folder_structure = [
@@ -19,13 +25,34 @@ def create_folder_structure(base_path):
         else:
             print(f"Folder already exists: {path}")
 
-def execute_cmd(params_path, hold, local_dir, force_dir):
-    cmd = f'sudo docker run -v {local_dir} -v {force_dir} -u "$(id -u):$(id -g)" davidfrantz/force ' \
-          "force-higher-level " \
-          f"{params_path}"
-
-
-    if hold == True:
-        subprocess.run(['xterm', '-hold', '-e', cmd])
+def execute_cmd(
+    params_path,
+    hold,
+    local_dir,
+    force_dir,
+    force_image="davidfrantz/force:3.9.02",
+    use_sudo=True,
+):
+    cmd = []
+    if use_sudo:
+        cmd.append("sudo")
+    cmd.extend(["docker", "run", "--rm"])
+    for mount in _mount_list(local_dir):
+        cmd.extend(["-v", mount])
+    if force_dir:
+        cmd.extend(["-v", force_dir])
+    cmd.extend(
+        [
+            "-u",
+            f"{os.getuid()}:{os.getgid()}",
+            force_image,
+            "force-higher-level",
+            params_path,
+        ]
+    )
+    print("Running command:")
+    print(" ".join(cmd))
+    if hold:
+        subprocess.run(["xterm", "-hold", "-e", *cmd], check=True)
     else:
-        subprocess.run(['xterm','-e', cmd])
+        subprocess.run(cmd, check=True)

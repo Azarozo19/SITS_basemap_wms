@@ -1,10 +1,10 @@
 import numpy as np
-import warnings
 
 
 PERCENTILE = 25
 LEAST_CLOUDY_FRACTION = 0.5
 MIN_SCENES = 1
+_RGBN_INDICES = None
 
 
 def forcepy_init(dates, sensors, bandnames):
@@ -14,13 +14,23 @@ def forcepy_init(dates, sensors, bandnames):
     bandnames: numpy.ndarray[nBands](str)
     """
 
+    global _RGBN_INDICES
+    _RGBN_INDICES = _resolve_band_indices(bandnames)
     return ["RED_P25", "GREEN_P25", "BLUE_P25", "NIR_P25", "VALID_SCENES"]
 
 
-def _select_least_cloudy_scenes(rgbn):
+def _resolve_band_indices(bandnames):
+    lookup = {name: index for index, name in enumerate(bandnames)}
+    required = (b"RED", b"GREEN", b"BLUE", b"BROADNIR")
+    missing = [name.decode("ascii") for name in required if name not in lookup]
+    if missing:
+        raise ValueError(f"Missing required input band(s): {', '.join(missing)}")
+    return tuple(lookup[name] for name in required)
+
+
+def _select_least_cloudy_scenes(valid_scenes):
     # Use the fraction of valid pixels in the current block as a scene-level
     # cloudiness proxy: more valid pixels means less cloud/shadow masking.
-    valid_scenes = np.all(np.isfinite(rgbn), axis=1)
     valid_fraction = valid_scenes.reshape(valid_scenes.shape[0], -1).mean(axis=1)
 
     ranked_idx = np.argsort(-valid_fraction, kind="stable")
@@ -32,52 +42,63 @@ def _select_least_cloudy_scenes(rgbn):
     return ranked_idx[:keep_count]
 
 
+def _nanpercentile_linear_inplace(values, percentile):
+    """Compute a temporal NaN percentile using an in-place partial partition."""
+    finite_counts = np.sum(np.isfinite(values), axis=0)
+    positions = (finite_counts - 1) * (percentile / 100.0)
+    positions = np.maximum(positions, 0)
+    lower = np.floor(positions).astype(np.intp)
+    upper = np.ceil(positions).astype(np.intp)
+
+    # Only the order statistics up to the requested percentile are needed.
+    max_upper = int(np.max(upper))
+    values.partition(np.arange(max_upper + 1), axis=0)
+    lower_values = np.take_along_axis(values, lower[np.newaxis], axis=0)[0]
+    upper_values = np.take_along_axis(values, upper[np.newaxis], axis=0)[0]
+    fraction = positions - lower
+    return lower_values + (upper_values - lower_values) * fraction
+
+
 def _write_rgb_p25(inarray, outarray, bandnames, nodata):
-    inarray = inarray.astype(np.float32)
-    invalid = inarray == nodata
-    invalid_masks = inarray == 0
+    global _RGBN_INDICES
+    if _RGBN_INDICES is None:
+        _RGBN_INDICES = _resolve_band_indices(bandnames)
+
+    # Allocate only the four bands needed by this product. FORCE provides all
+    # input bands as Int16, so casting the complete input cube is unnecessary.
+    shape = (inarray.shape[0], 4, inarray.shape[2], inarray.shape[3])
+    rgbn = np.empty(shape, dtype=np.float32)
+    for output_index, input_index in enumerate(_RGBN_INDICES):
+        rgbn[:, output_index, :, :] = inarray[:, input_index, :, :]
+
+    invalid = rgbn == nodata
     if np.all(invalid):
         return
+    rgbn[invalid] = np.nan
+    del invalid
+    zero_mask = rgbn == 0
+    rgbn[zero_mask] = np.nan
+    del zero_mask
 
-    inarray[invalid] = np.nan
-    inarray[invalid_masks] = np.nan
+    valid_scenes = np.all(np.isfinite(rgbn), axis=1)
+    selected_idx = _select_least_cloudy_scenes(valid_scenes)
 
-    red = np.argwhere(bandnames == b"RED")[0][0]
-    green = np.argwhere(bandnames == b"GREEN")[0][0]
-    blue = np.argwhere(bandnames == b"BLUE")[0][0]
-    nir = np.argwhere(bandnames == b"BROADNIR")[0][0]
-
-    rgbn = inarray[:, [red, green, blue, nir], :, :]
-    selected_idx = _select_least_cloudy_scenes(rgbn)
-
-    outarray[0][:] = nodata
-    outarray[1][:] = nodata
-    outarray[2][:] = nodata
-    outarray[3][:] = nodata
-    outarray[4][:] = nodata
+    outarray[...] = nodata
 
     if selected_idx.size == 0:
         return
 
     selected_rgbn = rgbn[selected_idx]
-    valid_scenes = np.all(np.isfinite(selected_rgbn), axis=1)
-    valid_scene_count = np.sum(valid_scenes, axis=0)
+    selected_valid_scenes = valid_scenes[selected_idx]
+    valid_scene_count = np.sum(selected_valid_scenes, axis=0)
     valid_pixels = valid_scene_count > 0
 
     if not np.any(valid_pixels):
         return
 
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message="All-NaN slice encountered")
-        red_p25 = np.nanpercentile(selected_rgbn[:, 0, :, :], PERCENTILE, axis=0)
-        green_p25 = np.nanpercentile(selected_rgbn[:, 1, :, :], PERCENTILE, axis=0)
-        blue_p25 = np.nanpercentile(selected_rgbn[:, 2, :, :], PERCENTILE, axis=0)
-        nir_p25 = np.nanpercentile(selected_rgbn[:, 3, :, :], PERCENTILE, axis=0)
+    percentiles = _nanpercentile_linear_inplace(selected_rgbn, PERCENTILE)
 
-    outarray[0][valid_pixels] = np.rint(red_p25[valid_pixels])
-    outarray[1][valid_pixels] = np.rint(green_p25[valid_pixels])
-    outarray[2][valid_pixels] = np.rint(blue_p25[valid_pixels])
-    outarray[3][valid_pixels] = np.rint(nir_p25[valid_pixels])
+    outarray[:4, valid_pixels] = np.rint(percentiles[:, valid_pixels])
     outarray[4][valid_pixels] = valid_scene_count[valid_pixels]
 
 

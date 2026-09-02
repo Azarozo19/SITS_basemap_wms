@@ -4,7 +4,9 @@ import json
 import shutil
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
+from uuid import uuid4
 
 import numpy as np
 import rasterio
@@ -26,7 +28,7 @@ PRODUCTS = {
 }
 
 REQUIRED_GDAL_TOOLS = ["gdalbuildvrt", "gdal_translate", "gdalwarp"]
-DEFAULT_COMPRESSION = "DEFLATE"
+DEFAULT_COMPRESSION = "ZSTD"
 DEFAULT_ZLEVEL = "9"
 DEFAULT_BIGTIFF = "IF_NEEDED"
 DEFAULT_BLOCKSIZE = 512
@@ -137,8 +139,24 @@ def write_tile_list(tile_paths: list[Path], temp_dir: Path) -> Path:
 
 def write_report(report_path: Path, payload: dict) -> Path:
     report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(json.dumps(payload, indent=2))
+    with atomic_output_path(report_path) as temporary_path:
+        temporary_path.write_text(json.dumps(payload, indent=2))
     return report_path
+
+
+@contextmanager
+def atomic_output_path(final_path: Path):
+    """Yield a same-directory temporary path and replace the target on success."""
+    final_path = Path(final_path)
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = final_path.with_name(
+        f".{final_path.stem}.{uuid4().hex}.building{final_path.suffix}"
+    )
+    try:
+        yield temporary_path
+        temporary_path.replace(final_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def make_output_tile_name(tile_path: Path, prefix: str | None = None) -> str:
@@ -276,51 +294,54 @@ def clip_raw_tile(
                 "source_path": str(tile_path),
                 "status": "skipped_non_intersecting",
             }
-        tile_cutline_geom = tile_bounds.intersection(aoi_union)
-        if tile_cutline_geom.is_empty:
-            return {
-                "tile": tile_path.name,
-                "source_path": str(tile_path),
-                "status": "skipped_empty_intersection",
-            }
-        tile_cutline_path = write_geometry_cutline(tile_cutline_geom, aoi_crs, temp_dir)
+        # Interior FORCE tiles need recompression but not a cutline warp.
+        if not aoi_union.covers(tile_bounds):
+            tile_cutline_geom = tile_bounds.intersection(aoi_union)
+            if tile_cutline_geom.is_empty:
+                return {
+                    "tile": tile_path.name,
+                    "source_path": str(tile_path),
+                    "status": "skipped_empty_intersection",
+                }
+            tile_cutline_path = write_geometry_cutline(tile_cutline_geom, aoi_crs, temp_dir)
 
     output_tile_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        if tile_cutline_path is not None:
-            cmd = [
-                "gdalwarp",
-                "-overwrite",
-                "-cutline",
-                str(tile_cutline_path),
-                "-crop_to_cutline",
-                "-srcnodata",
-                str(source_nodata),
-                "-dstnodata",
-                str(source_nodata),
-                "-multi",
-                "-wo",
-                f"NUM_THREADS={num_threads}",
-                "-wm",
-                str(cachemax_mb),
-                "-ot",
-                source_dtype.upper(),
-            ]
-            cmd.extend(build_creation_options(compression_method, predictor, zlevel, bigtiff, blocksize))
-            cmd.extend([str(tile_path), str(output_tile_path)])
-        else:
-            cmd = [
-                "gdal_translate",
-                "-of",
-                "GTiff",
-                "-a_nodata",
-                str(source_nodata),
-                "-ot",
-                source_dtype.upper(),
-            ]
-            cmd.extend(build_creation_options(compression_method, predictor, zlevel, bigtiff, blocksize))
-            cmd.extend([str(tile_path), str(output_tile_path)])
-        run_command(cmd)
+        with atomic_output_path(output_tile_path) as temporary_output_path:
+            if tile_cutline_path is not None:
+                cmd = [
+                    "gdalwarp",
+                    "-overwrite",
+                    "-cutline",
+                    str(tile_cutline_path),
+                    "-crop_to_cutline",
+                    "-srcnodata",
+                    str(source_nodata),
+                    "-dstnodata",
+                    str(source_nodata),
+                    "-multi",
+                    "-wo",
+                    f"NUM_THREADS={num_threads}",
+                    "-wm",
+                    str(cachemax_mb),
+                    "-ot",
+                    source_dtype.upper(),
+                ]
+                cmd.extend(build_creation_options(compression_method, predictor, zlevel, bigtiff, blocksize))
+                cmd.extend([str(tile_path), str(temporary_output_path)])
+            else:
+                cmd = [
+                    "gdal_translate",
+                    "-of",
+                    "GTiff",
+                    "-a_nodata",
+                    str(source_nodata),
+                    "-ot",
+                    source_dtype.upper(),
+                ]
+                cmd.extend(build_creation_options(compression_method, predictor, zlevel, bigtiff, blocksize))
+                cmd.extend([str(tile_path), str(temporary_output_path)])
+            run_command(cmd)
     finally:
         if tile_cutline_path is not None and tile_cutline_path.exists():
             tile_cutline_path.unlink()
@@ -373,6 +394,7 @@ def clip_force_raw_tiles(
 
     progress = tqdm(raw_tifs, desc=f"Clipping raw tiles for {job_name}", unit="tile", dynamic_ncols=True)
     for tile_path in progress:
+        tile_started = time.time()
         with rasterio.open(tile_path) as src:
             predictor = infer_predictor(src.dtypes[0], compression_method)
         output_tile_path = output_dir / make_output_tile_name(tile_path)
@@ -392,6 +414,7 @@ def clip_force_raw_tiles(
             blocksize=blocksize,
             fallback_nodata=fallback_nodata,
         )
+        tile_report["runtime_seconds"] = time.time() - tile_started
         tile_reports.append(tile_report)
         status = tile_report["status"]
         progress.set_postfix_str(f"{status}={tile_path.name}")
@@ -425,44 +448,52 @@ def clip_force_raw_tiles(
     return clipped_tile_paths, report_payload
 
 
-def _read_valid_mask(src, rgb_bands, valid_scene_band, min_valid_scenes=1):
-    rgb_valid = []
-    for band_idx in rgb_bands:
-        arr = src.read(band_idx).astype(np.float32)
-        nodata = src.nodatavals[band_idx - 1]
-        valid = np.isfinite(arr)
-        if nodata is not None:
-            valid &= arr != nodata
-        rgb_valid.append(valid)
+def _read_valid_mask(
+    src,
+    rgb_bands,
+    valid_scene_band,
+    min_valid_scenes=1,
+    rgb_values=None,
+    scene_count=None,
+):
+    if rgb_values is None:
+        rgb_values = src.read(rgb_bands)
+    if scene_count is None:
+        scene_count = src.read(valid_scene_band)
 
-    scene_count = src.read(valid_scene_band)
+    valid_mask = np.ones(rgb_values.shape[1:], dtype=bool)
+    for offset, band_idx in enumerate(rgb_bands):
+        values = rgb_values[offset]
+        if np.issubdtype(values.dtype, np.floating):
+            valid_mask &= np.isfinite(values)
+        nodata = src.nodatavals[band_idx - 1]
+        if nodata is not None:
+            valid_mask &= values != nodata
+
     scene_nodata = src.nodatavals[valid_scene_band - 1]
-    valid_mask = scene_count >= min_valid_scenes
+    valid_mask &= scene_count >= min_valid_scenes
     if scene_nodata is not None:
         valid_mask &= scene_count != scene_nodata
-
-    for valid in rgb_valid:
-        valid_mask &= valid
-
     return valid_mask
 
 
 def _sample_valid_values(input_tif, rgb_bands, valid_scene_band, sample_step, min_valid_scenes):
     with rasterio.open(input_tif) as src:
+        rgb_values = src.read(rgb_bands)
+        scene_count = src.read(valid_scene_band)
         valid_mask = _read_valid_mask(
             src,
             rgb_bands,
             valid_scene_band,
             min_valid_scenes=min_valid_scenes,
+            rgb_values=rgb_values,
+            scene_count=scene_count,
         )
         sampled_mask = valid_mask[::sample_step, ::sample_step]
         if not np.any(sampled_mask):
             return None
 
-        samples = []
-        for band_idx in rgb_bands:
-            arr = src.read(band_idx).astype(np.float32)
-            samples.append(arr[::sample_step, ::sample_step][sampled_mask])
+        samples = [arr[::sample_step, ::sample_step][sampled_mask] for arr in rgb_values]
 
     return np.concatenate(samples)
 
@@ -477,19 +508,22 @@ def _sample_scaled_values(
 ):
     lo, hi = stretch
     with rasterio.open(input_tif) as src:
+        rgb_values = src.read(rgb_bands)
+        scene_count = src.read(valid_scene_band)
         valid_mask = _read_valid_mask(
             src,
             rgb_bands,
             valid_scene_band,
             min_valid_scenes=min_valid_scenes,
+            rgb_values=rgb_values,
+            scene_count=scene_count,
         )
         sampled_mask = valid_mask[::sample_step, ::sample_step]
         if not np.any(sampled_mask):
             return None
 
         samples = []
-        for band_idx in rgb_bands:
-            arr = src.read(band_idx).astype(np.float32)
+        for arr in rgb_values:
             scaled = _scale_to_byte(arr, valid_mask, lo, hi)
             samples.append(scaled[::sample_step, ::sample_step][sampled_mask].astype(np.float32))
 
@@ -530,8 +564,10 @@ def compute_global_stretch(
 
 def _scale_to_byte(values, valid_mask, lo, hi):
     scaled = np.zeros(values.shape, dtype=np.uint8)
-    stretched = (values - lo) / (hi - lo)
-    stretched = np.clip(stretched * 255.0, 0, 255)
+    stretched = values.astype(np.float32)
+    stretched -= np.float32(lo)
+    stretched *= np.float32(255.0 / (hi - lo))
+    np.clip(stretched, 0, 255, out=stretched)
     scaled[valid_mask] = np.rint(stretched[valid_mask]).astype(np.uint8)
     return scaled
 
@@ -623,6 +659,93 @@ def _smooth_byte_band(values, valid_mask, size):
     return smoothed
 
 
+def adjust_rgb_tone(
+    scaled_rgb,
+    valid_mask,
+    gamma=1.0,
+    saturation=1.0,
+    channel_gains=(1.0, 1.0, 1.0),
+    neutral_protection=0.0,
+    green_suppression=0.0,
+    green_dominance_threshold=0.2,
+):
+    """Apply display tone and RGB balance while keeping invalid pixels black."""
+    if gamma <= 0:
+        raise ValueError("gamma must be positive")
+    if saturation < 0:
+        raise ValueError("saturation must be non-negative")
+    if len(channel_gains) != 3 or any(gain <= 0 for gain in channel_gains):
+        raise ValueError("channel_gains must contain three positive values")
+    if neutral_protection < 0:
+        raise ValueError("neutral_protection must be non-negative")
+    if not 0 <= green_suppression < 1:
+        raise ValueError("green_suppression must be at least 0 and less than 1")
+    if green_dominance_threshold <= 0:
+        raise ValueError("green_dominance_threshold must be positive")
+    if len(scaled_rgb) != 3:
+        raise ValueError("RGB tone adjustment requires exactly three bands")
+    if (
+        gamma == 1.0
+        and saturation == 1.0
+        and all(gain == 1.0 for gain in channel_gains)
+        and green_suppression == 0.0
+    ):
+        return scaled_rgb
+
+    rgb = np.stack(scaled_rgb).astype(np.float32)
+    rgb *= np.float32(1.0 / 255.0)
+    if gamma != 1.0:
+        np.power(rgb, np.float32(1.0 / gamma), out=rgb)
+
+    if saturation != 1.0:
+        luminance = (
+            np.float32(0.2126) * rgb[0]
+            + np.float32(0.7152) * rgb[1]
+            + np.float32(0.0722) * rgb[2]
+        )
+        rgb = luminance[np.newaxis] + np.float32(saturation) * (
+            rgb - luminance[np.newaxis]
+        )
+
+    gains = np.asarray(channel_gains, dtype=np.float32)[:, np.newaxis, np.newaxis]
+    if neutral_protection > 0 and not np.all(gains == 1.0):
+        peak = np.max(rgb, axis=0)
+        chroma = np.max(rgb, axis=0) - np.min(rgb, axis=0)
+        relative_chroma = np.divide(
+            chroma,
+            peak,
+            out=np.zeros_like(chroma),
+            where=peak > 0,
+        )
+        gain_strength = np.clip(relative_chroma / neutral_protection, 0.0, 1.0)
+        gains = 1.0 + gain_strength[np.newaxis] * (gains - 1.0)
+    rgb *= gains
+
+    if green_suppression > 0:
+        strongest_other = np.maximum(rgb[0], rgb[2])
+        green_dominance = np.maximum(rgb[1] - strongest_other, 0.0)
+        relative_dominance = np.divide(
+            green_dominance,
+            rgb[1],
+            out=np.zeros_like(green_dominance),
+            where=rgb[1] > 0,
+        )
+        suppression_strength = np.clip(
+            relative_dominance / green_dominance_threshold,
+            0.0,
+            1.0,
+        )
+        rgb[1] *= 1.0 - green_suppression * suppression_strength
+
+    np.clip(rgb, 0.0, 1.0, out=rgb)
+    adjusted = []
+    for band in rgb:
+        output = np.zeros(valid_mask.shape, dtype=np.uint8)
+        output[valid_mask] = np.rint(band[valid_mask] * 255.0).astype(np.uint8)
+        adjusted.append(output)
+    return adjusted
+
+
 def export_wms_rgb(
     input_tif,
     output_tif=None,
@@ -634,6 +757,12 @@ def export_wms_rgb(
     band_descriptions=("RED", "GREEN", "BLUE"),
     smooth_size=None,
     balance_targets=None,
+    gamma=1.0,
+    saturation=1.0,
+    channel_gains=(1.0, 1.0, 1.0),
+    neutral_protection=0.0,
+    green_suppression=0.0,
+    green_dominance_threshold=0.2,
     overwrite=False,
     compression_method=DEFAULT_COMPRESSION,
     bigtiff=DEFAULT_BIGTIFF,
@@ -655,31 +784,41 @@ def export_wms_rgb(
         stretch = compute_global_stretch([input_tif], rgb_bands=rgb_bands, valid_scene_band=valid_scene_band)
     lo, hi = stretch
 
-    with rasterio.open(input_tif) as src:
+    with atomic_output_path(output_path) as temporary_output_path, rasterio.open(input_tif) as src:
+        rgb_values = src.read(rgb_bands)
+        valid_scenes = src.read(valid_scene_band)
         valid_mask = _read_valid_mask(
             src,
             rgb_bands,
             valid_scene_band,
             min_valid_scenes=min_valid_scenes,
+            rgb_values=rgb_values,
+            scene_count=valid_scenes,
         )
         if not np.any(valid_mask):
             raise ValueError(f"No valid RGB pixels found for WMS export: {input_tif}")
 
         scaled_rgb = []
-        tile_samples = []
-        for band_idx in rgb_bands:
-            arr = src.read(band_idx).astype(np.float32)
+        for arr in rgb_values:
             scaled = _scale_to_byte(arr, valid_mask, lo, hi)
-            tile_samples.append(scaled[valid_mask].astype(np.float32))
             scaled_rgb.append(scaled)
-        tile_stats = _compute_tile_stats(tile_samples)
         if balance_targets is not None:
+            tile_stats = _compute_tile_stats([scaled[valid_mask] for scaled in scaled_rgb])
             scaled_rgb = [
                 _balance_byte_band(arr, valid_mask, target_stats, band_stats)
                 for arr, target_stats, band_stats in zip(scaled_rgb, balance_targets, tile_stats)
             ]
         scaled_rgb = [_smooth_byte_band(arr, valid_mask, smooth_size) for arr in scaled_rgb]
-        valid_scenes = src.read(valid_scene_band)
+        scaled_rgb = adjust_rgb_tone(
+            scaled_rgb,
+            valid_mask,
+            gamma=gamma,
+            saturation=saturation,
+            channel_gains=channel_gains,
+            neutral_protection=neutral_protection,
+            green_suppression=green_suppression,
+            green_dominance_threshold=green_dominance_threshold,
+        )
         valid_scene_nodata = src.nodatavals[valid_scene_band - 1]
 
         profile = src.profile.copy()
@@ -701,7 +840,7 @@ def export_wms_rgb(
         elif compression_method == "ZSTD":
             profile["zstd_level"] = int(zlevel)
 
-        with rasterio.open(output_path, "w", **profile) as dst:
+        with rasterio.open(temporary_output_path, "w", **profile) as dst:
             for idx, arr in enumerate(scaled_rgb, start=1):
                 dst.write(arr, idx)
             colorinterp = [ColorInterp.red, ColorInterp.green, ColorInterp.blue]
@@ -709,15 +848,15 @@ def export_wms_rgb(
             dst.set_band_description(2, band_descriptions[1])
             dst.set_band_description(3, band_descriptions[2])
             valid_scenes_out = np.zeros(valid_scenes.shape, dtype=np.uint8)
-            valid_scene_values = valid_scenes.astype(np.float32)
             valid_scene_mask = valid_mask.copy()
             if valid_scene_nodata is not None:
-                valid_scene_mask &= valid_scene_values != valid_scene_nodata
+                valid_scene_mask &= valid_scenes != valid_scene_nodata
             valid_scenes_out[valid_scene_mask] = np.clip(
-                np.rint(valid_scene_values[valid_scene_mask]), 0, 255
+                np.rint(valid_scenes[valid_scene_mask]), 0, 255
             ).astype(np.uint8)
             if add_alpha:
-                alpha = np.where(valid_mask, 255, 0).astype(np.uint8)
+                alpha = np.zeros(valid_mask.shape, dtype=np.uint8)
+                alpha[valid_mask] = 255
                 dst.write(alpha, 4)
                 dst.set_band_description(4, "ALPHA")
                 dst.write(valid_scenes_out, 5)
@@ -735,7 +874,15 @@ def export_wms_rgb(
 def build_vrt(tile_paths: list[Path], vrt_output_path: Path, temp_dir: Path) -> Path:
     tile_list_path = write_tile_list(tile_paths, temp_dir)
     try:
-        run_command(["gdalbuildvrt", "-input_file_list", str(tile_list_path), str(vrt_output_path)])
+        with atomic_output_path(vrt_output_path) as temporary_output_path:
+            run_command(
+                [
+                    "gdalbuildvrt",
+                    "-input_file_list",
+                    str(tile_list_path),
+                    str(temporary_output_path),
+                ]
+            )
         return vrt_output_path
     finally:
         if tile_list_path.exists():
@@ -758,39 +905,40 @@ def build_final_raster(
     predictor = infer_predictor("uint8", compression_method)
     cmd = ["gdal_translate", "-of", "GTiff"]
     cmd.extend(build_creation_options(compression_method, predictor, zlevel, bigtiff, blocksize))
-    cmd.extend([str(vrt_path), str(final_output_path)])
-    run_command(cmd)
+    with atomic_output_path(final_output_path) as temporary_output_path:
+        cmd.extend([str(vrt_path), str(temporary_output_path)])
+        run_command(cmd)
 
-    with rasterio.open(final_output_path, "r+") as dst:
-        dst.set_band_description(1, band_descriptions[0])
-        dst.set_band_description(2, band_descriptions[1])
-        dst.set_band_description(3, band_descriptions[2])
-        if add_alpha:
-            if dst.count >= 4:
-                dst.set_band_description(4, "ALPHA")
-            if dst.count >= 5:
-                dst.set_band_description(5, "VALID_SCENES")
-            if dst.count >= 5:
-                dst.colorinterp = (
-                    ColorInterp.red,
-                    ColorInterp.green,
-                    ColorInterp.blue,
-                    ColorInterp.alpha,
-                    ColorInterp.undefined,
-                )
-        else:
-            if dst.count >= 4:
-                dst.set_band_description(4, "VALID_SCENES")
-            if dst.count >= 4:
-                dst.colorinterp = (
-                    ColorInterp.red,
-                    ColorInterp.green,
-                    ColorInterp.blue,
-                    ColorInterp.undefined,
-                )
+        with rasterio.open(temporary_output_path, "r+") as dst:
+            dst.set_band_description(1, band_descriptions[0])
+            dst.set_band_description(2, band_descriptions[1])
+            dst.set_band_description(3, band_descriptions[2])
+            if add_alpha:
+                if dst.count >= 4:
+                    dst.set_band_description(4, "ALPHA")
+                if dst.count >= 5:
+                    dst.set_band_description(5, "VALID_SCENES")
+                if dst.count >= 5:
+                    dst.colorinterp = (
+                        ColorInterp.red,
+                        ColorInterp.green,
+                        ColorInterp.blue,
+                        ColorInterp.alpha,
+                        ColorInterp.undefined,
+                    )
+            else:
+                if dst.count >= 4:
+                    dst.set_band_description(4, "VALID_SCENES")
+                if dst.count >= 4:
+                    dst.colorinterp = (
+                        ColorInterp.red,
+                        ColorInterp.green,
+                        ColorInterp.blue,
+                        ColorInterp.undefined,
+                    )
 
-    if build_overviews:
-        build_overviews_inplace(final_output_path, resampling=overview_resampling)
+        if build_overviews:
+            build_overviews_inplace(temporary_output_path, resampling=overview_resampling)
     return final_output_path
 
 
@@ -809,8 +957,15 @@ def render_product_tiles(
     add_alpha=True,
     smooth_size=None,
     balance_mode=None,
+    gamma=1.0,
+    saturation=1.0,
+    channel_gains=(1.0, 1.0, 1.0),
+    neutral_protection=0.0,
+    green_suppression=0.0,
+    green_dominance_threshold=0.2,
     overwrite_tiles=False,
     build_overviews=True,
+    build_tile_overviews=False,
     overview_resampling=DEFAULT_OVERVIEW_RESAMPLING,
     skip_vrt=False,
     skip_final_raster=False,
@@ -836,6 +991,7 @@ def render_product_tiles(
     temp_dir.mkdir(parents=True, exist_ok=True)
     start_total = time.time()
 
+    stretch_stage_start = time.time()
     stretch = compute_global_stretch(
         input_tifs,
         rgb_bands=product["bands"],
@@ -845,8 +1001,11 @@ def render_product_tiles(
         sample_step=sample_step,
         min_valid_scenes=min_valid_scenes,
     )
+    stretch_stage_elapsed = time.time() - stretch_stage_start
     balance_targets = None
+    balance_stage_elapsed = None
     if balance_mode == "mean_std":
+        balance_stage_start = time.time()
         balance_targets = compute_balance_targets(
             input_tifs,
             rgb_bands=product["bands"],
@@ -855,6 +1014,7 @@ def render_product_tiles(
             min_valid_scenes=min_valid_scenes,
             stretch=stretch,
         )
+        balance_stage_elapsed = time.time() - balance_stage_start
 
     outputs: list[Path] = []
     reused_tiles = 0
@@ -862,6 +1022,7 @@ def render_product_tiles(
     tile_stage_start = time.time()
     progress = tqdm(input_tifs, desc=f"Rendering {product_name}", unit="tile", dynamic_ncols=True)
     for input_tif in progress:
+        tile_started = time.time()
         input_path = Path(input_tif)
         output_tif = output_dir / f"{input_path.stem}{product['suffix']}"
         existed_before = output_tif.exists()
@@ -877,6 +1038,12 @@ def render_product_tiles(
                 band_descriptions=product["descriptions"],
                 smooth_size=smooth_size,
                 balance_targets=balance_targets,
+                gamma=gamma,
+                saturation=saturation,
+                channel_gains=channel_gains,
+                neutral_protection=neutral_protection,
+                green_suppression=green_suppression,
+                green_dominance_threshold=green_dominance_threshold,
                 overwrite=overwrite_tiles,
                 compression_method=compression_method,
                 bigtiff=bigtiff,
@@ -889,7 +1056,7 @@ def render_product_tiles(
             status = "reused"
         else:
             status = "written"
-            if build_overviews:
+            if build_overviews and (skip_final_raster or build_tile_overviews):
                 build_overviews_inplace(output_path, resampling=overview_resampling)
         outputs.append(output_path)
         progress.set_postfix_str(f"{status}={input_path.name}")
@@ -898,6 +1065,7 @@ def render_product_tiles(
                 "source_path": str(input_path),
                 "output_path": str(output_path),
                 "status": status,
+                "runtime_seconds": time.time() - tile_started,
             }
         )
     progress.close()
@@ -942,9 +1110,28 @@ def render_product_tiles(
         "tile_count": len(outputs),
         "reused_tiles": reused_tiles,
         "stretch": {"low": stretch[0], "high": stretch[1]},
+        "low_pct": low_pct,
+        "high_pct": high_pct,
+        "sample_step": sample_step,
+        "min_valid_scenes": min_valid_scenes,
+        "gamma": gamma,
+        "saturation": saturation,
+        "channel_gains": list(channel_gains),
+        "neutral_protection": neutral_protection,
+        "green_suppression": green_suppression,
+        "green_dominance_threshold": green_dominance_threshold,
+        "compression_method": compression_method,
+        "bigtiff": bigtiff,
+        "zlevel": str(zlevel),
+        "blocksize": blocksize,
+        "overview_resampling": overview_resampling,
         "runtime_seconds": runtime_seconds,
         "runtime_human": format_duration(runtime_seconds),
         "stage_timings": {
+            "stretch_seconds": stretch_stage_elapsed,
+            "stretch_human": format_duration(stretch_stage_elapsed),
+            "balance_seconds": balance_stage_elapsed,
+            "balance_human": format_duration(balance_stage_elapsed) if balance_stage_elapsed is not None else None,
             "tile_render_seconds": tile_stage_elapsed,
             "tile_render_human": format_duration(tile_stage_elapsed),
             "vrt_seconds": vrt_stage_elapsed,

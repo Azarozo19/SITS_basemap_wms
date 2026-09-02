@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "project_name": "germany_dop10_2025",
+  "base_path": "/drive_mount",
+  "aoi": "/drive_mount/general_data/germany/2024_v1_0.shp",
+  "force": {
+    "image": "davidfrantz/force:3.9.02",
+    "force_mount": "/force:/force",
+    "local_mount": "/drive_mount:/opb_mount",
+    "use_sudo": true,
+    "workflow": "udf",
+    "udf_source": "utils/skel/udf_rgb_p25_least_cloudy_block.py",
+    "python_type": "CHUNK",
+    "date_range": ["2025-01-01", "2025-12-31"],
+    "chunk_size": [3000, 3000],
+    "resolution": 10,
+    "sensors": ["SEN2A", "SEN2B", "SEN2C"],
+    "target_sensor": "SEN2L",
+    "above_noise": 0,
+    "below_noise": 0,
+    "threads": {"read": 8, "compute": 22, "write": 4},
+    "validation": "full",
+    "resume_batch_size": 1
+  },
+  "render": {
+    "min_valid_scenes": 3,
+    "low_pct": 5.0,
+    "high_pct": 99.9,
+    "sample_step": 64,
+    "compression_method": "ZSTD",
+    "bigtiff": "YES",
+    "zlevel": "9",
+    "blocksize": 512,
+    "overview_resampling": "nearest",
+    "num_threads": "ALL_CPUS",
+    "cachemax_mb": 512
+  },
+  "products": {
+    "rgb": {
+      "gamma": 2.0,
+      "saturation": 0.8,
+      "rgb_gains": [1.07, 0.96, 1.15],
+      "neutral_protection": 0.4,
+      "green_suppression": 0.1,
+      "green_dominance_threshold": 0.2,
+      "expected_stretch": [139.0, 2500.0]
+    },
+    "cir": {
+      "gamma": 1.3,
+      "saturation": 0.8,
+      "rgb_gains": [1.0, 1.0, 1.0],
+      "neutral_protection": 0.0,
+      "green_suppression": 0.0,
+      "green_dominance_threshold": 0.2,
+      "expected_stretch": [166.0, 4124.0]
+    }
+  }
+}
